@@ -1,15 +1,15 @@
-from schema import Book
-from normalize import normalize_book, normalize_price
-import time
-import requests
-from pathlib import Path
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-from datetime import datetime, timezone
 from pydantic import ValidationError
-from save_books import save_books
+from datetime import datetime, timezone
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+from pathlib import Path
+import requests
+import time
+from save_run_report import save_run_report
 from save_errors import save_errors
-import json
+from save_books import save_books
+from normalize import normalize_book
+from schema import Book
 
 
 
@@ -20,8 +20,18 @@ import json
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 CACHE_DIR = PROJECT_DIR / "cache"
-
 OUTPUT_DIR = PROJECT_DIR / "output"
+
+
+# ==============================================
+# Run statistics
+# ==============================================
+
+RUN_STATS = {
+    "pages_fetched": 0,
+    "cache_hits": 0,
+    "failed_pages": 0
+}
 
 
 # ==============================================
@@ -38,10 +48,15 @@ TIMEOUT = 10
 
 def fetch_page(current_url, cache_file):
 
-    # Check if cache exists
+    # ------------------------------------------
+    # Check cache
+    # ------------------------------------------
+
     if cache_file.exists():
 
         print("CACHE HIT")
+
+        RUN_STATS["cache_hits"] += 1
 
         html = cache_file.read_text(
             encoding="utf-8"
@@ -53,45 +68,116 @@ def fetch_page(current_url, cache_file):
 
         return html
 
+    # ------------------------------------------
+    # Fetch from website
+    # ------------------------------------------
+
     print("FETCH")
 
     headers = {
         "User-Agent": USER_AGENT
     }
 
-    time.sleep(0.5)
+    for attempt in range(2):
 
-    response = requests.get(
-        current_url,
-        headers=headers,
-        timeout=TIMEOUT
-    )
+        try:
 
-    if response.status_code != 200:
-        raise Exception(
-            f"Fetch Failed HTTP {response.status_code}"
-        )
+            time.sleep(0.5)
 
-    # Decode response as UTF-8
-    html = response.content.decode("utf-8")
+            response = requests.get(
+                current_url,
+                headers=headers,
+                timeout=TIMEOUT
+            )
 
-    # Create cache directory if needed
-    CACHE_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+            # ----------------------------------
+            # Successful response
+            # ----------------------------------
 
-    # Save HTML to cache
-    cache_file.write_text(
-        html,
-        encoding="utf-8"
-    )
+            if response.status_code == 200:
 
-    print(
-        f"Response size: {len(html)} bytes"
-    )
+                RUN_STATS["pages_fetched"] += 1
 
-    return html
+                html = response.content.decode(
+                    "utf-8"
+                )
+
+                CACHE_DIR.mkdir(
+                    parents=True,
+                    exist_ok=True
+                )
+
+                cache_file.write_text(
+                    html,
+                    encoding="utf-8"
+                )
+
+                print(
+                    f"Response size: {len(html)} bytes"
+                )
+
+                return html
+
+            # ----------------------------------
+            # Retry server errors
+            # ----------------------------------
+
+            if 500 <= response.status_code <= 599:
+
+                if attempt == 0:
+
+                    print(
+                        f"HTTP {response.status_code}. "
+                        "Retrying once..."
+                    )
+
+                    time.sleep(1)
+
+                    continue
+
+                raise Exception(
+                    f"Fetch failed HTTP "
+                    f"{response.status_code}"
+                )
+
+            # ----------------------------------
+            # Do NOT retry 403 or 404
+            # ----------------------------------
+
+            if response.status_code in (403, 404):
+
+                raise Exception(
+                    f"Fetch failed HTTP "
+                    f"{response.status_code}"
+                )
+
+            # ----------------------------------
+            # Other HTTP errors
+            # ----------------------------------
+
+            raise Exception(
+                f"Fetch failed HTTP "
+                f"{response.status_code}"
+            )
+
+        except requests.Timeout:
+
+            if attempt == 0:
+
+                print(
+                    "Request timed out. "
+                    "Retrying once..."
+                )
+
+                time.sleep(1)
+
+                continue
+
+            raise Exception(
+                "Fetch failed: timeout after retry"
+            )
+
+    raise Exception("Fetch failed")
 
 
 # ==============================================
@@ -255,7 +341,7 @@ def extract_book_details(
         )
 
     # ------------------------------------------
-    # Fetch timestamp
+    # Timestamp
     # ------------------------------------------
 
     fetched_at = datetime.now(
@@ -263,7 +349,7 @@ def extract_book_details(
     ).isoformat()
 
     # ------------------------------------------
-    # Return raw record
+    # Raw record
     # ------------------------------------------
 
     return {
@@ -288,6 +374,20 @@ def main():
         "Books to scrape-Week:5 Assignment"
     )
 
+    # ------------------------------------------
+    # Start run timer
+    # ------------------------------------------
+
+    run_start = datetime.now(
+        timezone.utc
+    )
+
+    start_counter = time.perf_counter()
+
+    # ------------------------------------------
+    # Starting catalogue page
+    # ------------------------------------------
+
     current_url = (
         "https://books.toscrape.com/"
         "catalogue/page-1.html"
@@ -308,44 +408,55 @@ def main():
 
         catalogue_pages += 1
 
-        # Cache filename
         cache_file = (
             CACHE_DIR
             / f"catalogue-page-{catalogue_pages}.html"
         )
 
-        # Fetch catalogue page
-        html = fetch_page(
-            current_url,
-            cache_file
-        )
+        try:
 
-        # Extract book URLs
-        book_urls = extract_book_links(
-            html,
-            current_url
-        )
+            html = fetch_page(
+                current_url,
+                cache_file
+            )
 
-        # Store URL + source catalogue page
-        for book_url in book_urls:
-
-            discovered_books.append({
-                "product_url": book_url,
-                "source_page": current_url
-            })
-
-        print(
-            f"page-{catalogue_pages}="
-            f"{len(book_urls)} number books"
-        )
-
-        # Move to next page
-        if catalogue_pages < 3:
-
-            current_url = get_next_page(
+            book_urls = extract_book_links(
                 html,
                 current_url
             )
+
+            for book_url in book_urls:
+
+                discovered_books.append({
+                    "product_url": book_url,
+                    "source_page": current_url
+                })
+
+            print(
+                f"page-{catalogue_pages}="
+                f"{len(book_urls)} number books"
+            )
+
+            if catalogue_pages < 3:
+
+                current_url = get_next_page(
+                    html,
+                    current_url
+                )
+
+        except Exception as error:
+
+            RUN_STATS["failed_pages"] += 1
+
+            print(
+                f"Catalogue page failed: {error}"
+            )
+
+            print(
+                "Skipping catalogue page..."
+            )
+
+            current_url = None
 
     # ==========================================
     # Discovery results
@@ -388,7 +499,23 @@ def main():
     )
 
     # ==========================================
-    # Fetch and process books
+    # Stage 5 failure test
+    # ==========================================
+
+    # One fake URL is intentionally added
+    # to prove that one bad page does not
+    # kill the entire scraper.
+
+    unique_books.append({
+        "product_url":
+            "https://books.toscrape.com/"
+            "catalogue/fake-book-for-stage-5.html",
+
+        "source_page": "stage-5-test"
+    })
+
+    # ==========================================
+    # Process books
     # ==========================================
 
     records = []
@@ -402,145 +529,188 @@ def main():
         print()
 
         print(
-            f"Processing book {index}/{len(unique_books)}"
+            f"Processing book "
+            f"{index}/{len(unique_books)}"
         )
 
-        # Cache filename
         book_cache_file = (
             CACHE_DIR
             / f"book-{index}.html"
         )
 
-        # --------------------------------------
-        # Fetch
-        # --------------------------------------
-
-        book_html = fetch_page(
-            book["product_url"],
-            book_cache_file
-        )
-
-        # --------------------------------------
-        # Extract
-        # --------------------------------------
-
-        book_record = extract_book_details(
-            book_html,
-            book["product_url"],
-            book["source_page"]
-        )
-
-        # --------------------------------------
-        # Normalize
-        # --------------------------------------
-
-        book_record = normalize_book(
-            book_record
-        )
-
-        # --------------------------------------
-        # Validate
-        # --------------------------------------
-
-       # Validate normalized data
         try:
 
+            # ----------------------------------
+            # Fetch
+            # ----------------------------------
+
+            book_html = fetch_page(
+                book["product_url"],
+                book_cache_file
+            )
+
+            # ----------------------------------
+            # Extract
+            # ----------------------------------
+
+            book_record = extract_book_details(
+                book_html,
+                book["product_url"],
+                book["source_page"]
+            )
+
+            # ----------------------------------
+            # Normalize
+            # ----------------------------------
+
+            book_record = normalize_book(
+                book_record
+            )
+
+            # ----------------------------------
+            # Validate
+            # ----------------------------------
+
             validated_book = Book(
-            **book_record
+                **book_record
             )
 
             records.append(
-            validated_book
+                validated_book
+            )
+
+            print(
+                f"Book {index} processed successfully."
             )
 
         except ValidationError as error:
 
-                    errors.append({
-                    "record": book_record,
-                    "error": str(error)
-                })
+            errors.append({
+                "record": book_record,
+                "error": str(error)
+            })
 
-        print(
-        f"Validation failed for book {index}"
-       )
+            print(
+                f"Validation failed for book {index}"
+            )
+
+        except Exception as error:
+
+            RUN_STATS["failed_pages"] += 1
+
+            print(
+                f"Page failed for book {index}: "
+                f"{error}"
+            )
+
+            print(
+                "Skipping page and continuing..."
+            )
+
     # ==========================================
-    # Final results
+    # Save books
     # ==========================================
+
     save_books(
         records,
         OUTPUT_DIR
     )
 
+    # ==========================================
+    # Save errors
+    # ==========================================
 
     save_errors(
-    errors,
-    OUTPUT_DIR
-    )
-    print()
-
-    print(
-        f"detail_pages={len(records)}"
+        errors,
+        OUTPUT_DIR
     )
 
     # ==========================================
-    # Verify source pages
+    # Run report
     # ==========================================
 
-    print()
-
-    print("Source pages:")
-
-    print(
-        records[0].source_page
+    duration = (
+        time.perf_counter()
+        - start_counter
     )
 
-    print(
-        records[20].source_page
-    )
+    run_report = {
+        "start_time":
+            run_start.isoformat(),
 
-    print(
-        records[40].source_page
+        "duration_seconds":
+            round(duration, 2),
+
+        "pages_fetched":
+            RUN_STATS["pages_fetched"],
+
+        "cache_hits":
+            RUN_STATS["cache_hits"],
+
+        "valid_records":
+            len(records),
+
+        "invalid_records":
+            len(errors),
+
+        "failed_pages":
+            RUN_STATS["failed_pages"]
+    }
+
+    save_run_report(
+        run_report,
+        OUTPUT_DIR
     )
 
     # ==========================================
-    # First complete validated record
-    # ==========================================
-
-    print()
-
-    print(
-        "First complete validated record:"
-    )
-
-    print(
-        records[0]
-    )
-
-    # ==========================================
-    # Price normalization test
+    # Final results
     # ==========================================
 
     print()
 
     print(
-        "Price normalization test:"
+        "======================================"
     )
 
     print(
-        records[0].price_text
+        "RUN COMPLETE"
     )
 
     print(
-        records[0].price_gbp
+        "======================================"
     )
 
-    # ==========================================
-    # Finished
-    # ==========================================
+    print(
+        f"Valid records   : {len(records)}"
+    )
 
-    print()
+    print(
+        f"Invalid records : {len(errors)}"
+    )
 
-    print("Scraping and validation completed successfully.")
+    print(
+        f"Failed pages    : "
+        f"{RUN_STATS['failed_pages']}"
+    )
+
+    print(
+        f"Cache hits      : "
+        f"{RUN_STATS['cache_hits']}"
+    )
+
+    print(
+        f"Pages fetched   : "
+        f"{RUN_STATS['pages_fetched']}"
+    )
+
+    print(
+        f"Duration        : "
+        f"{round(duration, 2)} seconds"
+    )
+
+    print(
+        "======================================"
+    )
 
 
 # ==============================================

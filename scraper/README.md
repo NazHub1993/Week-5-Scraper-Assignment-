@@ -68,13 +68,13 @@ The scraper currently supports:
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME.git
+git clone https://github.com/NazHub1993/Week-5-Scraper-Assignment-.git
 ```
 
 Move into the project:
 
 ```bash
-cd YOUR_REPO_NAME
+cd scraper
 ```
 
 ---
